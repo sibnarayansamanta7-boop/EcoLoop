@@ -1,6 +1,6 @@
+const mongoose = require("mongoose");
 const Listing = require("../models/Listing");
 const User = require("../models/User");
-
 
 // ============================================
 // GET ALL LISTINGS
@@ -8,39 +8,45 @@ const User = require("../models/User");
 
 const getListings = async (req, res) => {
     try {
-        // IMPORTANT:
-        // First get the raw MongoDB documents.
-        // Do NOT populate here because we need to
-        // preserve the original owner ObjectId.
-        const listings =
-            await Listing.find({
-                status: {
-                    $ne: "reused"
-                }
-            })
-                .sort({
-                    createdAt: -1
-                })
-                .lean();
+        const listings = await Listing.find({
+            status: { $ne: "reused" }
+        })
+            .sort({ createdAt: -1 })
+            .lean();
 
-        // Collect all owner IDs
-        const ownerIds = listings
+        // Only keep owner IDs that are valid MongoDB ObjectIds.
+        const validOwnerIds = listings
             .map((item) => item.owner)
-            .filter(Boolean);
+            .filter((ownerId) =>
+                ownerId &&
+                mongoose.isValidObjectId(ownerId)
+            )
+            .map((ownerId) =>
+                new mongoose.Types.ObjectId(ownerId)
+            );
 
-        // Get the users separately
-        const users =
-            await User.find({
+        // Remove duplicate owner IDs.
+        const uniqueOwnerIds = [
+            ...new Map(
+                validOwnerIds.map((id) => [
+                    String(id),
+                    id
+                ])
+            ).values()
+        ];
+
+        let users = [];
+
+        if (uniqueOwnerIds.length > 0) {
+            users = await User.find({
                 _id: {
-                    $in: ownerIds
+                    $in: uniqueOwnerIds
                 }
             })
-                .select(
-                    "name email college"
-                )
+                .select("name email college")
                 .lean();
+        }
 
-        // Create quick lookup map
         const userMap = new Map();
 
         users.forEach((user) => {
@@ -50,71 +56,56 @@ const getListings = async (req, res) => {
             );
         });
 
-        // Attach owner information
-        const formattedListings =
-            listings.map((item) => {
+        const safeListings = listings
+            .map((item) => {
                 const ownerId =
-                    item.owner
+                    item.owner &&
+                    mongoose.isValidObjectId(item.owner)
                         ? String(item.owner)
                         : null;
 
-                const owner =
-                    ownerId
-                        ? userMap.get(
-                              ownerId
-                          ) || null
-                        : null;
+                const owner = ownerId
+                    ? userMap.get(ownerId) || null
+                    : null;
 
                 return {
                     ...item,
-
                     ownerId,
-
                     owner,
-
                     chatAvailable: Boolean(owner)
                 };
-            });
+            })
+            .filter(
+                (item) =>
+                    item.ownerId &&
+                    item.owner
+            );
 
         console.log(
             "LISTINGS OWNER DEBUG:"
         );
 
-        formattedListings.forEach(
-            (item) => {
-                console.log({
-                    title: item.title,
-                    ownerId:
-                        item.ownerId,
-                    owner:
-                        item.owner?.name ||
-                        null
-                });
-            }
-        );
+        safeListings.forEach((item) => {
+            console.log({
+                title: item.title,
+                ownerId: item.ownerId,
+                owner: item.owner?.name || null
+            });
+        });
 
-        // A listing without a real User owner cannot support requests
-        // or chat. Do not expose those stale/orphan records to the UI.
-        const safeListings =
-            formattedListings.filter(
-                (item) => item.chatAvailable
-            );
-
-        res.json({
+        return res.status(200).json({
             success: true,
             listings: safeListings
         });
-
     } catch (error) {
         console.error(
-            "Get listings error:",
+            "GET LISTINGS ERROR:",
             error
         );
 
-        res.status(500).json({
+        return res.status(500).json({
             success: false,
-            message:
-                "Failed to fetch listings"
+            message: "Failed to fetch listings"
         });
     }
 };
@@ -124,10 +115,7 @@ const getListings = async (req, res) => {
 // CREATE LISTING
 // ============================================
 
-const createListing = async (
-    req,
-    res
-) => {
+const createListing = async (req, res) => {
     try {
         const {
             title,
@@ -165,33 +153,38 @@ const createListing = async (
             });
         }
 
-        const listing =
-            await Listing.create({
-                owner: req.user._id,
-
-                title:
-                    title.trim(),
-
-                category,
-
-                condition,
-
-                mode,
-
-                value: Number(
-                    value || 0
-                ),
-
-                description:
-                    description.trim(),
-
-                image:
-                    image || "",
-
-                handoverLocation:
-                    handoverLocation?.trim() ||
-                    "Main Gate"
+        if (
+            !req.user ||
+            !req.user._id
+        ) {
+            return res.status(401).json({
+                success: false,
+                message:
+                    "Authentication required"
             });
+        }
+
+        const listing = await Listing.create({
+            owner: req.user._id,
+
+            title: title.trim(),
+
+            category,
+
+            condition,
+
+            mode,
+
+            value: Number(value || 0),
+
+            description: description.trim(),
+
+            image: image || "",
+
+            handoverLocation:
+                handoverLocation?.trim() ||
+                "Main Gate"
+        });
 
         const populatedListing =
             await Listing.findById(
@@ -203,7 +196,7 @@ const createListing = async (
                 )
                 .lean();
 
-        res.status(201).json({
+        return res.status(201).json({
             success: true,
 
             message:
@@ -217,14 +210,13 @@ const createListing = async (
                     listing.owner
             }
         });
-
     } catch (error) {
         console.error(
-            "Create listing error:",
+            "CREATE LISTING ERROR:",
             error
         );
 
-        res.status(500).json({
+        return res.status(500).json({
             success: false,
             message:
                 "Failed to create listing"
@@ -237,15 +229,22 @@ const createListing = async (
 // GET MY LISTINGS
 // ============================================
 
-const getMyListings = async (
-    req,
-    res
-) => {
+const getMyListings = async (req, res) => {
     try {
+        if (
+            !req.user ||
+            !req.user._id
+        ) {
+            return res.status(401).json({
+                success: false,
+                message:
+                    "Authentication required"
+            });
+        }
+
         const listings =
             await Listing.find({
-                owner:
-                    req.user._id
+                owner: req.user._id
             })
                 .sort({
                     createdAt: -1
@@ -265,31 +264,28 @@ const getMyListings = async (
             listings.map((item) => ({
                 ...item,
 
-                ownerId:
-                    item.owner
-                        ? String(
-                              item.owner
-                          )
-                        : null,
+                ownerId: item.owner
+                    ? String(item.owner)
+                    : null,
 
                 owner: user,
 
-                chatAvailable: Boolean(user)
+                chatAvailable:
+                    Boolean(user)
             }));
 
-        res.json({
+        return res.status(200).json({
             success: true,
             listings:
                 formattedListings
         });
-
     } catch (error) {
         console.error(
-            "My listings error:",
+            "MY LISTINGS ERROR:",
             error
         );
 
-        res.status(500).json({
+        return res.status(500).json({
             success: false,
             message:
                 "Failed to fetch your listings"
